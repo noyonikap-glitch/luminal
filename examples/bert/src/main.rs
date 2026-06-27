@@ -75,7 +75,8 @@ fn main() {
     //rt = cx.search(rt, CompileOptions::default().search_graph_limit(50));
 
     //luminal_cuda_lite::runtime::CudaRuntime::allocate_intermediate_buffers(&cx.dyn_map); //for LLIR
-
+    // prebuild CUDA graphs (allocates intermediate buffers)
+    rt.prebuild_graphs(&cx.dyn_map);
     // 6. execute
     rt.execute(&cx.dyn_map);
 
