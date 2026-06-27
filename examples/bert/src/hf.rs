@@ -100,7 +100,8 @@ pub fn combine_safetensors_to_fp32(
     let mut all_tensors: HashMap<String, StoredTensor> = HashMap::new();
     for name in st.names() {
         let tensor = st.tensor(name)?;
-        all_tensors.insert(name.to_string(), StoredTensor {
+        let clean_name = name.strip_prefix("bert.").unwrap_or(name);
+        all_tensors.insert(clean_name.to_string(), StoredTensor {
             shape: tensor.shape().to_vec(),
             data: tensor_to_f32(&tensor),
         });
