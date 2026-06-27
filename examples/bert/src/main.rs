@@ -66,7 +66,7 @@ fn main() {
     println!("Compiling...");
     rt = cx.search(rt, CompileOptions::default().search_graph_limit(50));
 
-    rt.allocate_intermediate_buffers(&cx.dyn_map); //for LLIR
+    luminal_cuda_lite::runtime::CudaRuntime::allocate_intermediate_buffers(&cx.dyn_map); //for LLIR
 
     // 6. execute
     rt.execute(&cx.dyn_map);
