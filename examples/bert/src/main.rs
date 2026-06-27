@@ -10,8 +10,7 @@ use tokenizers::Tokenizer;
 #[cfg(feature = "metal")]
 use luminal_metal::MetalRuntime as Runtime;
 #[cfg(feature = "cuda")]
-use luminal_cuda_lite::runtime::CudaRuntime as Runtime;
-
+use luminal::op::Runtime;
 const REPO_ID: &str = "bert-base-uncased";
 const PROMPT: &str = "The cat sat on the mat.";
 
@@ -48,15 +47,11 @@ fn main() {
     let pooled_out = pooled_out.output();
 
     // 4. initialize runtime
-    #[cfg(feature = "cuda")]
-    let ctx = luminal_cuda_lite::cudarc::driver::CudaContext::new(0).unwrap();
-    #[cfg(feature = "cuda")]
-    let stream = ctx.default_stream();
 
     #[cfg(feature = "metal")]
     let mut rt = Runtime::initialize(());
     #[cfg(feature = "cuda")]
-    let mut rt = Runtime::initialize(stream);
+    let mut rt = Runtime::new().unwrap();
 
     // 5. build search space + load weights + compile
     cx.build_search_space::<Runtime>(CompileOptions::default());
