@@ -59,14 +59,22 @@ fn main() {
     #[cfg(feature = "cuda")]
     cx.build_search_space::<luminal_cuda_lite::runtime::CudaRuntime>(CompileOptions::default());
 
-    rt.set_data(input_ids_t, input_ids.clone());
-    rt.set_data(position_ids_t, position_ids.clone());
-    rt.set_data(token_type_ids_t, token_type_ids.clone());
+    // load weights
+    rt.load_safetensors(&cx, prepared.weight_file.to_str().unwrap());
 
+    // compile/search with dummy data
     println!("Compiling...");
     rt = cx.search(rt, CompileOptions::default().search_graph_limit(50));
 
-    luminal_cuda_lite::runtime::CudaRuntime::allocate_intermediate_buffers(&cx.dyn_map); //for LLIR
+    rt.set_data(input_ids_t, input_ids);
+    rt.set_data(position_ids_t, position_ids);
+    rt.set_data(token_type_ids_t, token_type_ids);
+
+
+    //println!("Compiling...");
+    //rt = cx.search(rt, CompileOptions::default().search_graph_limit(50));
+
+    //luminal_cuda_lite::runtime::CudaRuntime::allocate_intermediate_buffers(&cx.dyn_map); //for LLIR
 
     // 6. execute
     rt.execute(&cx.dyn_map);
