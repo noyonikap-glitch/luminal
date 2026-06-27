@@ -60,24 +60,25 @@ fn main() {
     cx.build_search_space::<luminal_cuda_lite::runtime::CudaRuntime>(CompileOptions::default());
 
     // load weights
+    println!("Loading weights...");
     rt.load_safetensors(&cx, prepared.weight_file.to_str().unwrap());
 
-    // compile/search with dummy data
-    println!("Compiling...");
-    rt = cx.search(rt, CompileOptions::default().search_graph_limit(50));
+    // set dummy data BEFORE search
+    cx.set_dim('s', seq_len);
+    rt.set_data(input_ids_t, vec![1i32; seq_len]);
+    rt.set_data(position_ids_t, (0..seq_len as i32).collect::<Vec<_>>());
+    rt.set_data(token_type_ids_t, vec![0i32; seq_len]);
 
+    // search
+    println!("Compiling...");
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(100));
+
+    // set real inputs
     rt.set_data(input_ids_t, input_ids);
     rt.set_data(position_ids_t, position_ids);
     rt.set_data(token_type_ids_t, token_type_ids);
 
-
-    //println!("Compiling...");
-    //rt = cx.search(rt, CompileOptions::default().search_graph_limit(50));
-
-    //luminal_cuda_lite::runtime::CudaRuntime::allocate_intermediate_buffers(&cx.dyn_map); //for LLIR
-    // prebuild CUDA graphs (allocates intermediate buffers)
-    rt.prebuild_graphs(&cx.dyn_map);
-    // 6. execute
+    // execute — no prebuild_graphs
     rt.execute(&cx.dyn_map);
 
     // 7. print results
