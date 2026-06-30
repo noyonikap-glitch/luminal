@@ -105,8 +105,12 @@ pub fn combine_safetensors_to_fp32(
         let Some(stripped) = name.strip_prefix("bert.") else {
             continue;
         };
+
+        let stripped = stripped
+        .replace(".gamma", ".weight")
+        .replace(".beta", ".bias");
         let tensor = st.tensor(name)?;
-        all_tensors.insert(stripped.to_string(), StoredTensor {
+        all_tensors.insert(stripped, StoredTensor {
             shape: tensor.shape().to_vec(),
             data: tensor_to_f32(&tensor),
         });
