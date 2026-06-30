@@ -1,90 +1,139 @@
+#[cfg(feature = "cuda")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod hf;
 mod model;
 
-use hf::prepare_hf_model;
-use luminal::prelude::*;
+use hf::{prepare_hf_model, verify_weight_coverage};
 use luminal::dtype::DType;
+use luminal::prelude::*;
 use model::{Bert, BertConfig};
 use tokenizers::Tokenizer;
 
-#[cfg(feature = "metal")]
-use luminal_metal::MetalRuntime as Runtime;
 #[cfg(feature = "cuda")]
-//use luminal::op::Runtime;
-const REPO_ID: &str = "bert-base-uncased";
+use luminal_cuda_lite::{
+    cudarc::driver::CudaContext,
+    runtime::CudaRuntime,
+};
+#[cfg(feature = "cuda")]
+use luminal_tracing::*;
+#[cfg(feature = "metal")]
+use luminal_metal::MetalRuntime;
+#[cfg(feature = "cuda")]
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+const REPO_ID: &str = "google-bert/bert-base-uncased";
 const PROMPT: &str = "The cat sat on the mat.";
+const SEARCH_MEMORY_MIB: usize = 2048;
+const DEFAULT_SEARCH_GRAPHS: usize = 500;
+
+fn search_graph_limit() -> usize {
+    std::env::var("BERT_SEARCH_GRAPHS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_SEARCH_GRAPHS)
+}
+
+fn print_debug_hints() {
+    println!("Debug hints (set before `cargo run`):");
+    println!("  RUST_BACKTRACE=1              — full panic backtraces");
+    println!("  LUMINAL_SEARCH_DUMP_LAST_LLIR=1 — on CUDA, writes the last profiled");
+    println!("                               candidate to /tmp/luminal_search_last_candidate_llir.txt");
+    println!("  LLIR_DUMP_DIR=/tmp/llir      — dump selected LLIR after successful search");
+    println!("  BERT_SEARCH_GRAPHS=10        — lower search limit for faster failure loops");
+    println!("Search prints the first few `initial-genome filter reject` lines to stderr.");
+}
 
 fn main() {
-    let config = BertConfig::default();
+    #[cfg(feature = "cuda")]
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(luminal_filter())
+        .init();
 
-    // 1. download weights + tokenizer
+    let config = BertConfig::default();
+    let search_graphs = search_graph_limit();
+
     println!("Preparing model...");
     let prepared = prepare_hf_model(REPO_ID).expect("failed to prepare model");
+    println!("Weights: {}", prepared.weight_file.display());
 
-    // 2. tokenize
-    let tokenizer = Tokenizer::from_file(
-        prepared.model_dir.join("tokenizer.json")
-    ).unwrap();
+    let tokenizer =
+        Tokenizer::from_file(prepared.model_dir.join("tokenizer.json")).unwrap();
     let encoding = tokenizer.encode(PROMPT, true).unwrap();
     let seq_len = encoding.get_ids().len();
     let input_ids: Vec<i32> = encoding.get_ids().iter().map(|&x| x as i32).collect();
     let position_ids: Vec<i32> = (0..seq_len as i32).collect();
-    let token_type_ids: Vec<i32> = vec![0; seq_len];
+    let token_type_ids = vec![0i32; seq_len];
 
     println!("Tokens: {:?}", encoding.get_tokens());
+    println!("seq_len: {seq_len}");
 
-    // 3. build graph
     let mut cx = Graph::new();
     let input_ids_t = cx.named_tensor("input_ids", seq_len).as_dtype(DType::Int);
     let position_ids_t = cx.named_tensor("position_ids", seq_len).as_dtype(DType::Int);
     let token_type_ids_t = cx.named_tensor("token_type_ids", seq_len).as_dtype(DType::Int);
 
     let bert = Bert::init(&mut cx, config);
-    let (sequence_out, pooled_out) = bert.forward(
-        input_ids_t, position_ids_t, token_type_ids_t, config,
-    );
+    let (sequence_out, pooled_out) =
+        bert.forward(input_ids_t, position_ids_t, token_type_ids_t, config);
     let sequence_out = sequence_out.output();
     let pooled_out = pooled_out.output();
 
-    // 4. initialize runtime
+    verify_weight_coverage(&cx, &prepared.weight_file).expect("weight name mismatch");
 
-    #[cfg(feature = "metal")]
-    let mut rt = Runtime::initialize(());
-    #[cfg(feature = "cuda")]
-    let mut rt = luminal_cuda_lite::runtime::CudaRuntime::new().unwrap();
+    print_debug_hints();
 
-    // 5. build search space + load weights + compile
+    println!("Building E-Graph...");
     #[cfg(feature = "metal")]
     cx.build_search_space::<luminal_metal::MetalRuntime>(CompileOptions::default());
     #[cfg(feature = "cuda")]
-    cx.build_search_space::<luminal_cuda_lite::runtime::CudaRuntime>(CompileOptions::default());
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
 
-    // load weights
     println!("Loading weights...");
+    #[cfg(feature = "metal")]
+    let mut rt = MetalRuntime::initialize(());
+    #[cfg(feature = "cuda")]
+    let ctx = CudaContext::new(0).unwrap();
+    #[cfg(feature = "cuda")]
+    let stream = ctx.default_stream();
+    #[cfg(feature = "cuda")]
+    let mut rt = CudaRuntime::initialize(stream).with_max_memory_mib(SEARCH_MEMORY_MIB);
+
     rt.load_safetensors(&cx, prepared.weight_file.to_str().unwrap());
 
-    // set dummy data BEFORE search
-    cx.set_dim('s', seq_len);
+    // Dummy inputs for search profiling (same shapes as the real run).
     rt.set_data(input_ids_t, vec![1i32; seq_len]);
-    rt.set_data(position_ids_t, (0..seq_len as i32).collect::<Vec<_>>());
+    rt.set_data(position_ids_t, position_ids.clone());
     rt.set_data(token_type_ids_t, vec![0i32; seq_len]);
 
-    // search
-    println!("Compiling...");
-    rt = cx.search(rt, CompileOptions::default().search_graph_limit(100));
+    println!("Compiling (search_graph_limit={search_graphs})...");
+    rt = cx.search(
+        rt,
+        CompileOptions::default()
+            .search_graph_limit(search_graphs)
+            .search_log(true),
+    );
 
-    // set real inputs
+    #[cfg(feature = "cuda")]
+    rt.release_pooled_memory();
+
     rt.set_data(input_ids_t, input_ids);
     rt.set_data(position_ids_t, position_ids);
     rt.set_data(token_type_ids_t, token_type_ids);
 
-    // execute — no prebuild_graphs
     rt.execute(&cx.dyn_map);
 
-    // 7. print results
     let pooled = rt.get_f32(pooled_out);
     let sequence = rt.get_f32(sequence_out);
 
-    println!("[CLS] pooled embedding (first 8 values): {:?}", &pooled[..8]);
-    println!("sequence[0] first 8 values: {:?}", &sequence[..8]);
+    println!(
+        "[CLS] pooled embedding (first 8 values): {:?}",
+        &pooled[..8.min(pooled.len())]
+    );
+    println!(
+        "sequence row 0 (first 8 values): {:?}",
+        &sequence[..8.min(sequence.len())]
+    );
 }

@@ -1,10 +1,12 @@
 use half::{bf16, f16};
 use hf_hub::api::sync::Api;
+use luminal::graph::Graph;
+use luminal::hlir::Input;
 use memmap2::MmapOptions;
 use safetensors::{Dtype, SafeTensors, tensor::TensorView};
 use serde::Deserialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::Write,
     path::{Path, PathBuf},
@@ -79,7 +81,8 @@ fn tensor_to_f32(tensor: &safetensors::tensor::TensorView) -> Vec<f32> {
 pub fn combine_safetensors_to_fp32(
     model_dir: &Path,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let output = model_dir.join("model_combined_fp32.safetensors");
+    // v2: strip the `bert.` prefix so names match model.rs `persist(...)` labels.
+    let output = model_dir.join("model_combined_fp32_v2.safetensors");
     // Skip if we already converted on a previous run
     if output.exists() {
         return Ok(output);
@@ -99,9 +102,11 @@ pub fn combine_safetensors_to_fp32(
     // so Luminal's runtime can load them without dtype handling
     let mut all_tensors: HashMap<String, StoredTensor> = HashMap::new();
     for name in st.names() {
+        let Some(stripped) = name.strip_prefix("bert.") else {
+            continue;
+        };
         let tensor = st.tensor(name)?;
-        let clean_name = name.strip_prefix("bert.").unwrap_or(name);
-        all_tensors.insert(clean_name.to_string(), StoredTensor {
+        all_tensors.insert(stripped.to_string(), StoredTensor {
             shape: tensor.shape().to_vec(),
             data: tensor_to_f32(&tensor),
         });
@@ -136,6 +141,65 @@ pub fn prepare_hf_model(repo_id: &str) -> Result<PreparedModel, Box<dyn std::err
     let model_dir = download_hf_model(repo_id)?;
     let weight_file = combine_safetensors_to_fp32(&model_dir)?;
     Ok(PreparedModel { model_dir, weight_file })
+}
+
+const RUNTIME_INPUTS: &[&str] = &["input_ids", "position_ids", "token_type_ids"];
+
+/// Fail fast if combined weights don't match graph `persist(...)` labels.
+/// `load_safetensors` silently skips missing names, which makes search failures
+/// hard to diagnose on GPU runtimes.
+pub fn verify_weight_coverage(
+    cx: &Graph,
+    weight_file: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = File::open(weight_file)?;
+    let mmap = unsafe { MmapOptions::new().map(&file)? };
+    let st = SafeTensors::deserialize(&mmap)?;
+    let available: HashSet<String> = st.names().into_iter().map(String::from).collect();
+
+    let mut missing = Vec::new();
+    for node in cx.graph.node_indices() {
+        let Some(input) = (*cx.graph[node]).as_any().downcast_ref::<Input>() else {
+            continue;
+        };
+        if RUNTIME_INPUTS.contains(&input.label.as_str()) {
+            continue;
+        }
+        if !available.contains(&input.label) {
+            missing.push(input.label.clone());
+        }
+    }
+    missing.sort();
+
+    if missing.is_empty() {
+        println!(
+            "Weight coverage OK: {} checkpoint tensors, all graph weights present",
+            available.len()
+        );
+        return Ok(());
+    }
+
+    eprintln!(
+        "Missing {} weight(s) in {}:",
+        missing.len(),
+        weight_file.display()
+    );
+    for name in missing.iter().take(20) {
+        eprintln!("  - {name}");
+    }
+    if missing.len() > 20 {
+        eprintln!("  ... and {} more", missing.len() - 20);
+    }
+    if weight_file
+        .file_name()
+        .is_some_and(|n| n == "model_combined_fp32.safetensors")
+    {
+        eprintln!(
+            "Hint: delete the old v1 combined file and rerun so \
+             model_combined_fp32_v2.safetensors is regenerated with bert. prefix stripped."
+        );
+    }
+    Err(format!("{} weight tensor(s) missing from combined file", missing.len()).into())
 }
 
 #[cfg(test)]
